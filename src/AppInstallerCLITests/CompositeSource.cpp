@@ -2412,3 +2412,297 @@ TEST_CASE("CompositeSource_RestRetrieval_ManifestNamePublisherPairs", "[RestSour
     }
     REQUIRE(setup.ManifestRequests == 1);
 }
+
+struct CatalogVersionSpec
+{
+    std::string Version;
+    std::string Channel;
+};
+
+std::shared_ptr<ICompositePackage> MakeAvailablePackageWithVersions(
+    CompositeTestSetup& setup,
+    const std::string& id,
+    const std::string& productCode,
+    const std::vector<CatalogVersionSpec>& versions)
+{
+    THROW_HR_IF(E_UNEXPECTED, versions.empty());
+
+    TestPackageHelper helper = setup.MakeAvailable();
+    helper.WithId(id).WithPC(productCode).WithVersion(versions[0].Version);
+    if (!versions[0].Channel.empty())
+    {
+        helper.WithChannel(versions[0].Channel);
+    }
+
+    for (size_t i = 1; i < versions.size(); ++i)
+    {
+        auto& manifest = helper.MakeManifest();
+        manifest.WithId(id).WithPC(productCode).WithVersion(versions[i].Version);
+        if (!versions[i].Channel.empty())
+        {
+            manifest.WithChannel(versions[i].Channel);
+        }
+    }
+
+    return helper;
+}
+
+// Shared strong identifiers (product code across channel or history packages).
+// A full installed search returns before reverse correlation, so the forward path must
+// select a package only when installed version evidence is unique. It must not prefer
+// the first result or a particular channel. An explicit id query still selects that id.
+TEST_CASE("CompositeSource_SharedStrongId_DisambiguateByUniqueInstalledVersion", "[CompositeSource]")
+{
+    const std::string productCode = "shared-product-code";
+    const std::string stableId = "Contoso.Stable";
+    const std::string betaId = "Contoso.Beta";
+
+    CompositeTestSetup setup;
+    std::string installedVersion = "2.0";
+    std::string installedChannel;
+    std::vector<CatalogVersionSpec> stableVersions{ { "1.0", "" }, { "3.0", "" } };
+    std::vector<CatalogVersionSpec> betaVersions{ { "9.0", "" }, { "2.0", "" } };
+    std::string expectedId = betaId;
+
+    SECTION("Historical version matches only the later candidate")
+    {
+        // betaVersions lists 9.0 before the installed 2.0, and stable is returned first.
+    }
+    SECTION("Version published by both packages stays uncorrelated")
+    {
+        stableVersions = { { "2.0", "" }, { "3.0", "" } };
+        betaVersions = { { "1.0", "" }, { "2.0", "" } };
+        expectedId.clear();
+    }
+    SECTION("Equivalent version strings are not unique")
+    {
+        installedVersion = "1.0";
+        stableVersions = { { "1.0", "" } };
+        betaVersions = { { "1.0.0", "" } };
+        expectedId.clear();
+    }
+    SECTION("Distinct supplemental version text selects its package")
+    {
+        installedVersion = "4.6.7 Beta 2";
+        stableVersions = { { "4.6.7", "" } };
+        betaVersions = { { "4.6.7 Beta 2", "" } };
+        expectedId = betaId;
+    }
+    SECTION("Version published by neither package stays uncorrelated")
+    {
+        stableVersions = { { "1.0", "" } };
+        betaVersions = { { "3.0", "" } };
+        expectedId.clear();
+    }
+    SECTION("Installed channel matches only the candidate that published that channel")
+    {
+        installedChannel = "beta";
+        stableVersions = { { "2.0", "" } };
+        betaVersions = { { "2.0", "beta" } };
+        expectedId = betaId;
+    }
+    SECTION("Installed channel does not fall back to another channel's version")
+    {
+        installedChannel = "beta";
+        stableVersions = { { "2.0", "" } };
+        betaVersions = { { "9.0", "beta" } };
+        expectedId.clear();
+    }
+    SECTION("Empty installed channel does not choose between channeled copies")
+    {
+        stableVersions = { { "2.0", "" } };
+        betaVersions = { { "2.0", "beta" } };
+        expectedId.clear();
+    }
+    SECTION("Unknown installed version is not evidence")
+    {
+        installedVersion = "Unknown";
+        stableVersions = { { "1.0", "" } };
+        betaVersions = { { "2.0", "" } };
+        expectedId.clear();
+    }
+
+    auto stablePackage = MakeAvailablePackageWithVersions(setup, stableId, productCode, stableVersions);
+    auto betaPackage = MakeAvailablePackageWithVersions(setup, betaId, productCode, betaVersions);
+    auto installed = setup.MakeInstalled().WithId("ARP.Shared").WithPC(productCode).WithVersion(installedVersion).
+        WithMetadata(PackageVersionMetadata::PinnedState, "PinnedByManifest");
+    if (!installedChannel.empty())
+    {
+        installed.WithChannel(installedChannel);
+    }
+    setup.Installed->Everything.Matches.emplace_back(installed, Criteria());
+
+    setup.Available->SearchFunction = [&](const SearchRequest& request)
+    {
+        SearchResult result;
+        if (SearchRequestIncludes(request.Inclusions, PackageMatchField::ProductCode, MatchType::Exact, productCode))
+        {
+            // Stable is first so selecting the first strong match fails the unique-beta cases.
+            result.Matches.emplace_back(stablePackage, Criteria(PackageMatchField::ProductCode));
+            result.Matches.emplace_back(betaPackage, Criteria(PackageMatchField::ProductCode));
+        }
+        return result;
+    };
+
+    // Reading version keys is expected once multiple strong matches exist.
+    SearchResult result = setup.Search(true);
+
+    REQUIRE(result.Matches.size() == 1);
+    REQUIRE(GetInstalledVersion(result.Matches[0].Package));
+    auto metadata = GetInstalledVersion(result.Matches[0].Package)->GetMetadata();
+    REQUIRE(metadata[PackageVersionMetadata::PinnedState] == "PinnedByManifest");
+
+    auto available = result.Matches[0].Package->GetAvailable();
+    if (expectedId.empty())
+    {
+        REQUIRE(available.empty());
+    }
+    else
+    {
+        REQUIRE(available.size() == 1);
+        REQUIRE(available[0]->GetProperty(PackageProperty::Id).get() == expectedId);
+    }
+}
+
+TEST_CASE("CompositeSource_SharedStrongId_ExactIdDoesNotSwitchChannel", "[CompositeSource]")
+{
+    const std::string productCode = "shared-product-code";
+    const std::string stableId = "Contoso.Stable";
+    const std::string betaId = "Contoso.Beta";
+
+    CompositeTestSetup setup;
+    std::string queriedId = stableId;
+    std::string expectedBroadId = stableId;
+    bool versionInBoth = false;
+
+    SECTION("Explicit id matches the unique installed version")
+    {
+    }
+    SECTION("Explicit id is honored when the installed version belongs to the other package")
+    {
+        queriedId = betaId;
+    }
+    SECTION("Explicit id is honored when the version is published by both packages")
+    {
+        versionInBoth = true;
+        expectedBroadId.clear();
+        queriedId = betaId;
+    }
+
+    std::vector<CatalogVersionSpec> stableVersions{ { "2.0", "" }, { "3.0", "" } };
+    std::vector<CatalogVersionSpec> betaVersions{ { "9.0", "" } };
+    if (versionInBoth)
+    {
+        stableVersions = { { "2.0", "" } };
+        betaVersions = { { "2.0", "" } };
+    }
+
+    auto stablePackage = MakeAvailablePackageWithVersions(setup, stableId, productCode, stableVersions);
+    auto betaPackage = MakeAvailablePackageWithVersions(setup, betaId, productCode, betaVersions);
+    auto installed = setup.MakeInstalled().WithId("ARP.Shared").WithPC(productCode).WithVersion("2.0"sv).ToPackage();
+
+    setup.Installed->Everything.Matches.emplace_back(installed, Criteria());
+    setup.Installed->SearchFunction = [&](const SearchRequest& request)
+    {
+        SearchResult result;
+        if (SearchRequestIncludes(request.Inclusions, PackageMatchField::ProductCode, MatchType::Exact, productCode))
+        {
+            result.Matches.emplace_back(installed, PackageMatchFilter{ PackageMatchField::ProductCode, MatchType::Exact, productCode });
+        }
+        return result;
+    };
+    setup.Available->SearchFunction = [&](const SearchRequest& request)
+    {
+        SearchResult result;
+        if (SearchRequestIncludes(request.Inclusions, PackageMatchField::Id, MatchType::Exact, stableId) ||
+            SearchRequestIncludes(request.Filters, PackageMatchField::Id, MatchType::Exact, stableId) ||
+            SearchRequestIncludes(request.Filters, PackageMatchField::Id, MatchType::CaseInsensitive, stableId))
+        {
+            result.Matches.emplace_back(stablePackage, Criteria(PackageMatchField::Id));
+            return result;
+        }
+        if (SearchRequestIncludes(request.Inclusions, PackageMatchField::Id, MatchType::Exact, betaId) ||
+            SearchRequestIncludes(request.Filters, PackageMatchField::Id, MatchType::Exact, betaId) ||
+            SearchRequestIncludes(request.Filters, PackageMatchField::Id, MatchType::CaseInsensitive, betaId))
+        {
+            result.Matches.emplace_back(betaPackage, Criteria(PackageMatchField::Id));
+            return result;
+        }
+        if (SearchRequestIncludes(request.Inclusions, PackageMatchField::ProductCode, MatchType::Exact, productCode))
+        {
+            result.Matches.emplace_back(stablePackage, Criteria(PackageMatchField::ProductCode));
+            result.Matches.emplace_back(betaPackage, Criteria(PackageMatchField::ProductCode));
+        }
+        return result;
+    };
+
+    // Reading version keys is expected once multiple strong matches exist.
+    SearchResult broad = setup.Search(true);
+    REQUIRE(broad.Matches.size() == 1);
+    auto broadAvailable = broad.Matches[0].Package->GetAvailable();
+    if (expectedBroadId.empty())
+    {
+        REQUIRE(broadAvailable.empty());
+    }
+    else
+    {
+        REQUIRE(broadAvailable.size() == 1);
+        REQUIRE(broadAvailable[0]->GetProperty(PackageProperty::Id).get() == expectedBroadId);
+    }
+
+    size_t versionCalls = setup.Available->CountOfCallsRequiringVersionData;
+    SearchRequest exactId;
+    exactId.Inclusions.emplace_back(PackageMatchField::Id, MatchType::Exact, queriedId);
+    SearchResult exact = setup.Composite.Search(exactId);
+    // The explicit id path correlates the requested package back to installed.
+    // It does not read version history or replace the requested id.
+    REQUIRE(setup.Available->CountOfCallsRequiringVersionData == versionCalls);
+    REQUIRE(exact.Matches.size() == 1);
+    REQUIRE(GetInstalledVersion(exact.Matches[0].Package));
+    auto exactAvailable = exact.Matches[0].Package->GetAvailable();
+    REQUIRE(exactAvailable.size() == 1);
+    REQUIRE(exactAvailable[0]->GetProperty(PackageProperty::Id).get() == queriedId);
+}
+
+TEST_CASE("CompositeSource_SharedStrongId_TrackingWinsOverInstalledVersion", "[CompositeSource]")
+{
+    const std::string productCode = "shared-product-code";
+    const std::string stableId = "Contoso.Stable";
+    const std::string betaId = "Contoso.Beta";
+    const std::string packageFamilyName = "Contoso.Beta_pfn";
+
+    CompositeWithTrackingTestSetup setup;
+    // Version evidence would select stable. Tracking recorded beta, which does not publish 2.0.
+    auto stablePackage = MakeAvailablePackageWithVersions(setup, stableId, productCode, { { "2.0", "" } });
+    TestPackageHelper betaHelper = setup.MakeAvailable();
+    betaHelper.WithId(betaId).WithPC(productCode).WithPFN(packageFamilyName).WithVersion("9.0"sv);
+    auto betaPackage = betaHelper.ToPackage();
+    auto installed = setup.MakeInstalled().WithId("ARP.Shared").WithPC(productCode).WithPFN(packageFamilyName).WithVersion("2.0"sv);
+
+    setup.Installed->Everything.Matches.emplace_back(installed, Criteria());
+    setup.Available->SearchFunction = [&](const SearchRequest& request)
+    {
+        SearchResult result;
+        if (SearchRequestIncludes(request.Filters, PackageMatchField::Id, MatchType::CaseInsensitive, betaId) ||
+            SearchRequestIncludes(request.Filters, PackageMatchField::Id, MatchType::Exact, betaId))
+        {
+            result.Matches.emplace_back(betaPackage, Criteria(PackageMatchField::Id));
+            return result;
+        }
+        if (SearchRequestIncludes(request.Inclusions, PackageMatchField::ProductCode, MatchType::Exact, productCode))
+        {
+            result.Matches.emplace_back(stablePackage, Criteria(PackageMatchField::ProductCode));
+            result.Matches.emplace_back(betaPackage, Criteria(PackageMatchField::ProductCode));
+        }
+        return result;
+    };
+
+    setup.Tracking->GetIndex().AddManifest(betaHelper);
+
+    // setup.Search rejects version-history reads. Tracking must win without them.
+    SearchResult result = setup.Search();
+    REQUIRE(result.Matches.size() == 1);
+    auto available = result.Matches[0].Package->GetAvailable();
+    REQUIRE(available.size() == 1);
+    REQUIRE(available[0]->GetProperty(PackageProperty::Id).get() == betaId);
+}
