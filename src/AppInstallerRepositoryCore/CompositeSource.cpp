@@ -46,36 +46,141 @@ namespace AppInstaller::Repository
             return std::move(availablePackages.front());
         }
 
-        // Move returns if there is only one package in the matches that is strong; otherwise returns an empty value.
-        std::shared_ptr<ICompositePackage> FindOnlyStrongMatchFieldResult(std::vector<ResultMatch>& matches)
+        // When several packages share a strong identifier, select one only if the installed
+        // version is published by exactly one of them. Result order and package id text are not evidence.
+        // A non-empty installed channel must match that version; an empty channel does not prefer either copy.
+        // An empty result leaves the package uncorrelated. Callers must not use this to override tracking.
+        std::shared_ptr<ICompositePackage> FindUniqueStrongMatchByInstalledVersion(
+            const std::vector<std::shared_ptr<ICompositePackage>>& strongMatches,
+            const IPackage* installedPackage)
         {
-            std::shared_ptr<ICompositePackage> result;
+            if (!installedPackage || strongMatches.size() < 2)
+            {
+                return {};
+            }
+
+            auto installedVersionObject = installedPackage->GetLatestVersion();
+            if (!installedVersionObject)
+            {
+                return {};
+            }
+
+            const Utility::Version installedVersion{ installedVersionObject->GetProperty(PackageVersionProperty::Version).get() };
+            if (installedVersion.IsEmpty() || installedVersion.IsUnknown() || installedVersion.IsLatest())
+            {
+                AICLI_LOG(Repo, Info, << "  Installed version is not usable to disambiguate strong matches");
+                return {};
+            }
+
+            // Match a reported installed channel. An empty channel does not select the unchanneled copy.
+            const std::string installedChannel = installedVersionObject->GetProperty(PackageVersionProperty::Channel).get();
+
+            std::shared_ptr<ICompositePackage> uniqueMatch;
+            size_t matchCount = 0;
+
+            for (const auto& candidate : strongMatches)
+            {
+                const auto available = OnlyAvailable(candidate);
+                bool versionMatched = false;
+
+                for (const auto& key : available->GetVersionKeys())
+                {
+                    if (Utility::Version{ key.Version } != installedVersion)
+                    {
+                        continue;
+                    }
+
+                    if (!installedChannel.empty() && !Utility::ICUCaseInsensitiveEquals(key.Channel, installedChannel))
+                    {
+                        continue;
+                    }
+
+                    versionMatched = true;
+                    break;
+                }
+
+                if (versionMatched)
+                {
+                    ++matchCount;
+                    uniqueMatch = candidate;
+                }
+            }
+
+            if (matchCount == 1)
+            {
+                AICLI_LOG(Repo, Info, << "  Installed version '" << installedVersion.ToString() <<
+                    "' uniquely matched package id: " << uniqueMatch->GetProperty(PackageProperty::Id));
+                return uniqueMatch;
+            }
+
+            AICLI_LOG(Repo, Info, << "  Installed version '" << installedVersion.ToString() << "' matched " << matchCount <<
+                " of " << strongMatches.size() << " strong match packages; not disambiguating");
+            return {};
+        }
+
+        // Returns the only strong match, or the single package uniquely identified by installed version.
+        // Multiple strong matches with no unique version evidence produce an empty result.
+        std::shared_ptr<ICompositePackage> FindOnlyStrongMatchFieldResult(
+            std::vector<ResultMatch>& matches,
+            const IPackage* installedPackage,
+            bool allowInstalledVersionDisambiguation)
+        {
+            std::vector<std::shared_ptr<ICompositePackage>> strongMatches;
 
             for (auto&& match : matches)
             {
                 AICLI_LOG(Repo, Info, << "  Checking match with package id: " << match.Package->GetProperty(PackageProperty::Id));
 
-                if (IsStrongMatchField(match.MatchCriteria.Field))
+                if (!IsStrongMatchField(match.MatchCriteria.Field))
                 {
-                    if (!result)
+                    continue;
+                }
+
+                bool duplicate = false;
+                const auto candidatePackage = OnlyAvailable(match.Package);
+                for (const auto& existing : strongMatches)
+                {
+                    if (OnlyAvailable(existing)->IsSame(candidatePackage.get()))
                     {
-                        result = std::move(match.Package);
-                    }
-                    else
-                    {
-                        AICLI_LOG(Repo, Info, << "  Found multiple packages with strong match fields");
-                        result.reset();
+                        duplicate = true;
                         break;
                     }
                 }
+
+                if (!duplicate)
+                {
+                    strongMatches.emplace_back(std::move(match.Package));
+                }
             }
 
-            return result;
+            if (strongMatches.size() == 1)
+            {
+                return std::move(strongMatches[0]);
+            }
+
+            if (strongMatches.size() > 1)
+            {
+                AICLI_LOG(Repo, Info, << "  Found multiple packages with strong match fields");
+
+                if (allowInstalledVersionDisambiguation)
+                {
+                    return FindUniqueStrongMatchByInstalledVersion(strongMatches, installedPackage);
+                }
+            }
+
+            return {};
         }
 
-        // Gets a single matching package from the results
+        // Gets a single matching package from the results.
+        // allowInstalledVersionDisambiguation is for shared strong identifiers with no tracking package.
+        // Tracking already records the package id WinGet installed and must not be replaced by version evidence.
         template <typename MultipleIntro, typename Indeterminate>
-        std::shared_ptr<ICompositePackage> GetMatchingPackage(std::vector<ResultMatch>& matches, MultipleIntro&& multipleIntro, Indeterminate&& indeterminate)
+        std::shared_ptr<ICompositePackage> GetMatchingPackage(
+            std::vector<ResultMatch>& matches,
+            const IPackage* installedPackage,
+            bool allowInstalledVersionDisambiguation,
+            MultipleIntro&& multipleIntro,
+            Indeterminate&& indeterminate)
         {
             if (matches.empty())
             {
@@ -89,7 +194,7 @@ namespace AppInstaller::Repository
             {
                 multipleIntro();
 
-                auto result = FindOnlyStrongMatchFieldResult(matches);
+                auto result = FindOnlyStrongMatchFieldResult(matches, installedPackage, allowInstalledVersionDisambiguation);
 
                 if (!result)
                 {
@@ -1551,7 +1656,12 @@ namespace AppInstaller::Repository
                             availableResult = result.SearchAndHandleFailures(source, systemReferenceSearch);
                         }
 
-                        auto availablePackage = GetMatchingPackage(availableResult.Matches,
+                        // Version evidence is consulted only when tracking did not already identify the package.
+                        // A tracking id is the record of what WinGet installed and wins over a version match.
+                        auto availablePackage = GetMatchingPackage(
+                            availableResult.Matches,
+                            installedPackage.get(),
+                            !trackingPackage,
                             [&]() {
                                 AICLI_LOG(Repo, Info,
                                 << "Found multiple matches for installed package [" << installedPackage->GetProperty(PackageProperty::Id) <<
@@ -1592,7 +1702,10 @@ namespace AppInstaller::Repository
                 result.Matches.emplace_back(std::move(compositePackage), std::move(match.MatchCriteria));
             }
 
-            // Optimization for the "everything installed" case, no need to allow for reverse correlations
+            // Optimization for the "everything installed" case, no need to allow for reverse correlations.
+            // Reverse correlation is not a safe recovery for multiple strong identifier matches: available
+            // results are ordered, and a second correlation from the same source is ignored. Shared strong
+            // identifiers are resolved above only when the installed version identifies one candidate.
             if (request.IsForEverything() && m_searchBehavior == CompositeSearchBehavior::Installed)
             {
                 return result.ConvertToSearchResult();
